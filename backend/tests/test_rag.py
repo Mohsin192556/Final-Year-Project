@@ -168,6 +168,7 @@ def test_chat_api_surfaces_gemini_quota_errors_without_retrying(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.7-flash")
     monkeypatch.setattr(
         rag,
         "_load_index",

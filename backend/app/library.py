@@ -12,7 +12,16 @@ from dotenv import load_dotenv
 from langchain_core.embeddings import FakeEmbeddings
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCUMENTS_DIR = ROOT / "data" / "documents"
+
+
+def documents_directory() -> Path:
+    configured = Path(
+        os.getenv("LEGAL_DOCUMENTS_DIRECTORY", "data/documents")
+    )
+    return configured if configured.is_absolute() else ROOT / configured
+
+
+DOCUMENTS_DIR = documents_directory()
 SOURCES_FILE = DOCUMENTS_DIR / "sources.json"
 load_dotenv(ROOT / ".env")
 

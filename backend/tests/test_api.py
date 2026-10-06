@@ -115,6 +115,15 @@ def test_normalize_page_text_removes_running_header_and_preserves_structure() ->
     )
 
 
+def test_documents_directory_supports_render_persistent_disk(
+    monkeypatch, tmp_path
+) -> None:
+    persistent_directory = tmp_path / "persistent-documents"
+    monkeypatch.setenv("LEGAL_DOCUMENTS_DIRECTORY", str(persistent_directory))
+
+    assert library.documents_directory() == persistent_directory
+
+
 def test_parse_excluded_pages_supports_ranges_and_reports_invalid_input() -> None:
     assert main.parse_excluded_pages("1-3, 7, 9-10") == [1, 2, 3, 7, 9, 10]
     try:

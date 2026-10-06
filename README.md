@@ -118,6 +118,35 @@ never API keys or other secrets. Do not deploy as production until document
 persistence, admin access controls, Gemini quotas, and the source-update process
 have been reviewed.
 
+## Deploy the backend to Render
+
+Create a Render **Web Service** from this repository with **Root Directory**
+`backend`, **Build Command** `pip install -r requirements.txt`, and **Start
+Command** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Use a Python
+runtime supported by the selected Render plan and dependencies.
+
+Attach a persistent disk mounted at `/var/data` (select a plan that supports
+persistent disks), then add these environment variables in Render:
+
+- `GOOGLE_API_KEY`: your Gemini API key; mark it secret.
+- `ADMIN_API_KEY`: a newly generated, strong random secret of at least 24
+  characters; never reuse a key exposed during development.
+- `GEMINI_MODEL`: the model available to your Google AI project, for example
+  `gemini-3.6-flash`.
+- `CHROMA_PERSIST_DIRECTORY`: `/var/data/chroma`.
+- `LEGAL_DOCUMENTS_DIRECTORY`: `/var/data/documents`.
+- `CORS_ORIGINS`: after the Vercel site exists, its exact origin, such as
+  `https://your-project.vercel.app` (no trailing slash). Add any additional
+  trusted origins comma-separated; do not use `*`.
+
+The persistent disk is needed for both the vector index and uploaded PDFs/source
+manifest. Once Render deploys, check `/api/health`, set the Vercel
+`NEXT_PUBLIC_API_BASE_URL` to the Render service origin, update `CORS_ORIGINS`
+to the actual Vercel domain, and redeploy both services if environment values
+changed. Upload or restore and index the verified legal documents on the
+persistent service before relying on chat; local development files are not
+automatically copied to Render.
+
 ## Validate
 
 Backend tests:
