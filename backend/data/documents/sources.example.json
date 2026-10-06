@@ -1,0 +1,11 @@
+{
+  "sources": {
+    "example-act.pdf": {
+      "title": "Replace with the document title",
+      "citation": "Replace with a verified legal citation",
+      "jurisdiction": "Pakistan / province / territory",
+      "source_url": "https://replace-with-an-official-source",
+      "verified": false
+    }
+  }
+}

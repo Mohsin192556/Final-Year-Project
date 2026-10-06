@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.venv-*/
+venv/
+
+# Secrets and local data
+.env
+.env.*
+!.env.example
+!.env.local.example
+backend/data/chroma/
+backend/data/documents/sources.json
+backend/data/documents/*.pdf
+backend/data/documents/*.txt
+backend/data/documents/uploads/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+frontend/.env.local
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
