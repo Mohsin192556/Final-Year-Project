@@ -22,6 +22,7 @@ node_modules/
 .next/
 out/
 frontend/.env.local
+frontend/.vercel/
 npm-debug.log*
 
 # Editor / OS

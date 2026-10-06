@@ -2,6 +2,7 @@
 
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { apiUrl } from "../lib/api";
 
 type Source = {
   source_id: string;
@@ -18,10 +19,6 @@ type ChatMessage = {
   sources?: Source[];
   disclaimer?: string;
 };
-
-const apiBase = (
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
-).replace(/\/$/, "");
 
 const suggestions = [
   "What should I know before signing a rental agreement?",
@@ -126,7 +123,17 @@ export default function Home() {
 
   useEffect(() => {
     let active = true;
-    fetch(`${apiBase}/api/health`)
+    let healthRequest: Promise<Response>;
+    try {
+      healthRequest = fetch(apiUrl("/api/health"));
+    } catch {
+      setHealth("offline");
+      return () => {
+        active = false;
+      };
+    }
+
+    healthRequest
       .then((response) => {
         if (active) setHealth(response.ok ? "online" : "offline");
       })
@@ -154,7 +161,7 @@ export default function Home() {
     setMessages([...priorMessages, { role: "user", content }]);
 
     try {
-      const response = await fetch(`${apiBase}/api/chat`, {
+      const response = await fetch(apiUrl("/api/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

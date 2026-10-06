@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { FormEvent, useCallback, useRef, useState } from "react";
+import { apiUrl } from "../../lib/api";
 
 type LegalDocument = {
   id: string;
@@ -33,10 +34,6 @@ type DocumentPreview = {
   quality: NonNullable<LegalDocument["quality"]>;
 };
 
-const apiBase = (
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
-).replace(/\/$/, "");
-
 export default function LibraryPage() {
   const [adminKey, setAdminKey] = useState("");
   const [authenticated, setAuthenticated] = useState(false);
@@ -56,7 +53,7 @@ export default function LibraryPage() {
 
   const request = useCallback(
     (path: string, init: RequestInit = {}) =>
-      fetch(`${apiBase}${path}`, {
+      fetch(apiUrl(path), {
         ...init,
         headers: {
           Authorization: `Bearer ${adminKey}`,

@@ -88,6 +88,36 @@ npm run dev
 Open `http://localhost:3000`. Set `NEXT_PUBLIC_API_BASE_URL` when the backend is
 hosted at a different origin.
 
+## Deploy the frontend to Vercel
+
+The Next.js frontend can be deployed to Vercel. The FastAPI API and its uploaded
+documents and Chroma index must be hosted separately on a service with persistent
+disk storage; this repository is not configured to run the complete backend on
+Vercel serverless functions.
+
+1. Import this GitHub repository into Vercel.
+2. Set **Root Directory** to `frontend`. Leave the framework as Next.js and use
+   the detected install/build commands (`npm install` and `npm run build`).
+3. In Vercel project settings, add `NEXT_PUBLIC_API_BASE_URL` for Production and
+   Preview. Set it to the HTTPS origin of the deployed FastAPI service, with no
+   trailing slash (for example, `https://api.example.com`). This value is
+   embedded in the frontend at build time, so redeploy after changing it.
+4. Deploy the FastAPI backend separately with `GOOGLE_API_KEY`,
+   `GEMINI_MODEL`, a strong `ADMIN_API_KEY`, and a persistent volume mounted for
+   the configured `CHROMA_PERSIST_DIRECTORY`. Keep the uploaded documents and
+   source manifest on persistent storage as well.
+5. Set the backend's `CORS_ORIGINS` to the exact Vercel production origin (and
+   any specific preview origins that need API access), separated by commas.
+   Do not use `*` when credentials/admin requests are enabled.
+6. Verify `https://api.example.com/api/health` returns `{"status":"ok"}` and
+   `https://api.example.com/api/health/knowledge-base` reports `indexed` before
+   testing chat on the Vercel deployment.
+
+The browser-visible `NEXT_PUBLIC_API_BASE_URL` must contain only the API origin,
+never API keys or other secrets. Do not deploy as production until document
+persistence, admin access controls, Gemini quotas, and the source-update process
+have been reviewed.
+
 ## Validate
 
 Backend tests:
