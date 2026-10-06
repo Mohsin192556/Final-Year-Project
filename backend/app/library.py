@@ -1,103 +1,30 @@
 import hashlib
 import json
-import os
+import logging
 import re
-import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from langchain_core.embeddings import FakeEmbeddings
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from app.supabase_store import (
+    response_rows,
+    storage_bucket,
+    supabase_client,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def documents_directory() -> Path:
-    configured = Path(
-        os.getenv("LEGAL_DOCUMENTS_DIRECTORY", "data/documents")
-    )
-    return configured if configured.is_absolute() else ROOT / configured
-
-
-DOCUMENTS_DIR = documents_directory()
-SOURCES_FILE = DOCUMENTS_DIR / "sources.json"
+MAX_PDF_BYTES = 30 * 1024 * 1024
+logger = logging.getLogger(__name__)
 load_dotenv(ROOT / ".env")
 
 
-class EmbeddingQuotaExceeded(RuntimeError):
-    pass
-
-
-def storage_path() -> Path:
-    configured = Path(os.getenv("CHROMA_PERSIST_DIRECTORY", "data/chroma"))
-    return configured if configured.is_absolute() else ROOT / configured
-
-
-def _build_embeddings(backend: str | None = None):
-    backend_name = (backend or os.getenv("EMBEDDING_BACKEND", "google")).lower()
-    if backend_name == "local":
-        return FakeEmbeddings(size=768)
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-    return GoogleGenerativeAIEmbeddings(
-        model=os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
-    )
-
-
-def _quota_error(exc: BaseException) -> bool:
-    text = str(exc)
-    return "429" in text or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower()
-
-
-def document_path(relative_path: str) -> Path:
-    base = DOCUMENTS_DIR.resolve()
-    path = (base / relative_path).resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("The source manifest contains an unsafe document path.")
-    return path
-
-
-def load_sources() -> dict[str, dict[str, object]]:
-    if not SOURCES_FILE.is_file():
-        return {}
-    try:
-        content = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("The legal source manifest contains invalid JSON.") from exc
-    if not isinstance(content, dict) or not isinstance(content.get("sources"), dict):
-        raise ValueError("The legal source manifest must contain a sources object.")
-    records = content["sources"]
-    valid_records = {
-        key: value
-        for key, value in records.items()
-        if isinstance(key, str) and isinstance(value, dict)
-    }
-    for relative_path in valid_records:
-        document_path(relative_path)
-    return valid_records
-
-
-def save_sources(records: dict[str, dict[str, object]]) -> None:
-    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    temporary_file = SOURCES_FILE.with_suffix(".tmp")
-    temporary_file.write_text(
-        json.dumps({"sources": records}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    temporary_file.replace(SOURCES_FILE)
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as document:
-        for block in iter(lambda: document.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def document_fingerprint(path: Path, record: dict[str, object]) -> str:
+def document_fingerprint(content: bytes, record: dict[str, object]) -> str:
     index_metadata = {
         key: record.get(key)
         for key in (
@@ -109,48 +36,92 @@ def document_fingerprint(path: Path, record: dict[str, object]) -> str:
         )
     }
     payload = {
-        "file_sha256": file_sha256(path),
+        "file_sha256": hashlib.sha256(content).hexdigest(),
         "metadata": index_metadata,
     }
     serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _document(document_id: str) -> dict[str, object]:
+    rows = response_rows(
+        supabase_client()
+        .table("legal_documents")
+        .select("*")
+        .eq("id", document_id)
+        .limit(1)
+        .execute()
+    )
+    if not rows:
+        raise KeyError("Document not found.")
+    return rows[0]
+
+
+def _download_document(storage_path: str) -> bytes:
+    content = supabase_client().storage.from_(storage_bucket()).download(storage_path)
+    if not isinstance(content, bytes):
+        raise RuntimeError("Supabase Storage returned an invalid PDF response.")
+    return content
+
+
+def _active_index_row() -> dict[str, object] | None:
+    rows = response_rows(
+        supabase_client()
+        .table("legal_index_state")
+        .select("*")
+        .eq("id", True)
+        .limit(1)
+        .execute()
+    )
+    if not rows or not rows[0].get("active_version"):
+        return None
+    return rows[0]
+
+
+def active_index_manifest() -> dict[str, object] | None:
+    row = _active_index_row()
+    if row is None:
+        return None
+    return {
+        "index_version": row["active_version"],
+        "documents": row.get("fingerprints") or {},
+        "document_count": row.get("document_count", 0),
+        "indexed_page_count": row.get("indexed_page_count", 0),
+        "chunk_count": row.get("chunk_count", 0),
+        "indexed_at": row.get("indexed_at"),
+    }
+
+
 def list_documents() -> list[dict[str, object]]:
-    records = load_sources()
-    active_index_path = storage_path() / "active-index.json"
-    active_index: dict[str, object] = {}
-    if active_index_path.is_file():
-        try:
-            loaded_index = json.loads(active_index_path.read_text(encoding="utf-8"))
-            if isinstance(loaded_index, dict):
-                active_index = loaded_index
-        except json.JSONDecodeError:
-            active_index = {}
+    records = response_rows(
+        supabase_client()
+        .table("legal_documents")
+        .select("*")
+        .eq("status", "ready")
+        .execute()
+    )
+    active_index = active_index_manifest() or {}
     indexed_documents = active_index.get("documents", {})
     if not isinstance(indexed_documents, dict):
         indexed_documents = {}
 
     documents = []
-    for relative_path, record in records.items():
-        path = document_path(relative_path)
-        fingerprint = (
-            document_fingerprint(path, record) if path.is_file() else None
-        )
+    for record in records:
+        storage_path = str(record["storage_path"])
         is_verified = record.get("verified") is True
         is_indexed = bool(
-            fingerprint
-            and indexed_documents.get(relative_path) == fingerprint
+            record.get("fingerprint")
+            and indexed_documents.get(storage_path) == record.get("fingerprint")
             and is_verified
         )
         documents.append(
             {
-                "id": record.get("id", relative_path),
-                "title": record.get("title", path.stem),
+                "id": record["id"],
+                "title": record.get("title", "Legal document"),
                 "citation": record.get("citation", ""),
                 "jurisdiction": record.get("jurisdiction", "Pakistan"),
                 "source_url": record.get("source_url", ""),
-                "original_filename": record.get("original_filename", path.name),
+                "original_filename": record.get("original_filename", ""),
                 "excluded_pages": record.get("excluded_pages", []),
                 "verified": is_verified,
                 "indexed": is_indexed,
@@ -172,53 +143,189 @@ def preview_document(
 ) -> dict[str, object]:
     from pypdf import PdfReader
 
-    records = load_sources()
-    for relative_path, record in records.items():
-        if record.get("id", relative_path) != document_id:
-            continue
-        path = document_path(relative_path)
-        if not path.is_file():
-            raise FileNotFoundError("The uploaded PDF is missing.")
-        reader = PdfReader(str(path))
+    record = _document(document_id)
+    content = _download_document(str(record["storage_path"]))
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary:
+        temporary.write(content)
+        temporary_path = Path(temporary.name)
+    try:
+        reader = PdfReader(str(temporary_path))
         if reader.is_encrypted:
             raise ValueError("This PDF is password-protected.")
         page_count = len(reader.pages)
         if page_number < 1 or page_number > page_count:
             raise IndexError("Requested page is outside this PDF.")
 
-        quality = record.get("quality")
-        if not isinstance(quality, dict):
-            _, quality = analyze_pdf(path)
-            record["quality"] = quality
-            save_sources(records)
-
         text = normalize_page_text(
             reader.pages[page_number - 1].extract_text(extraction_mode="layout") or ""
         )
         return {
             "document_id": document_id,
-            "title": record.get("title", path.stem),
+            "title": record.get("title", "Legal document"),
             "page_number": page_number,
             "page_count": page_count,
             "text": text[:6000],
             "truncated": len(text) > 6000,
-            "quality": quality,
+            "quality": record.get("quality"),
         }
-    raise KeyError("Document not found.")
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def create_document_upload(
+    *,
+    title: str,
+    citation: str,
+    jurisdiction: str,
+    source_url: str,
+    original_filename: str,
+    verified: bool,
+    excluded_pages: list[int],
+) -> dict[str, object]:
+    document_id = str(uuid4())
+    path = f"uploads/{document_id}.pdf"
+    storage = supabase_client().storage.from_(storage_bucket())
+    signed_response = storage.create_signed_upload_url(path)
+    signed_data = (
+        signed_response
+        if isinstance(signed_response, dict)
+        else getattr(signed_response, "data", None)
+    )
+    if not isinstance(signed_data, dict) or not isinstance(
+        signed_data.get("token"), str
+    ):
+        raise RuntimeError("Supabase did not return a signed upload token.")
+
+    client = supabase_client()
+    client.table("legal_documents").insert(
+        {
+            "id": document_id,
+            "storage_path": path,
+            "title": title,
+            "citation": citation,
+            "jurisdiction": jurisdiction,
+            "source_url": source_url,
+            "original_filename": Path(original_filename).name[:255],
+            "verified": verified,
+            "excluded_pages": excluded_pages,
+            "status": "pending",
+        }
+    ).execute()
+    return {
+        "id": document_id,
+        "storage_path": path,
+        "upload_token": signed_data["token"],
+        "bucket": storage_bucket(),
+    }
+
+
+def _remove_pending_upload(document_id: str, path: str) -> None:
+    client = supabase_client()
+    client.storage.from_(storage_bucket()).remove([path])
+    client.table("legal_documents").delete().eq("id", document_id).execute()
+
+
+def complete_document_upload(document_id: str) -> dict[str, object]:
+    from pypdf.errors import PdfReadError
+
+    record = _document(document_id)
+    if record.get("status") == "ready":
+        return {
+            "id": document_id,
+            "title": record.get("title", "Legal document"),
+            "status": "needs_indexing" if record.get("verified") else "needs_review",
+            "verified": record.get("verified") is True,
+            "quality": record.get("quality"),
+        }
+    if record.get("status") != "pending":
+        raise ValueError("This upload is not waiting for completion.")
+    path = str(record["storage_path"])
+    content = _download_document(path)
+    if len(content) > MAX_PDF_BYTES or not content.startswith(b"%PDF-"):
+        _remove_pending_upload(document_id, path)
+        raise ValueError("The uploaded file is not a valid PDF within the size limit.")
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary:
+        temporary.write(content)
+        temporary_path = Path(temporary.name)
+    try:
+        _, quality = analyze_pdf(temporary_path, max_pages=1000)
+    except (ValueError, OSError, PdfReadError) as exc:
+        _remove_pending_upload(document_id, path)
+        raise ValueError(f"Could not read PDF: {exc}") from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    page_count = int(quality["page_count"])
+    excluded_pages = record.get("excluded_pages") or []
+    if any(
+        not isinstance(page_number, int)
+        or isinstance(page_number, bool)
+        or page_number < 1
+        or page_number > page_count
+        for page_number in excluded_pages
+    ):
+        _remove_pending_upload(document_id, path)
+        raise ValueError("Skipped page numbers are outside this PDF.")
+
+    fingerprint = document_fingerprint(content, record)
+    rows = response_rows(
+        supabase_client()
+        .table("legal_documents")
+        .update(
+            {
+                "quality": quality,
+                "fingerprint": fingerprint,
+                "status": "ready",
+            }
+        )
+        .eq("id", document_id)
+        .eq("status", "pending")
+        .select("id")
+        .execute()
+    )
+    if not rows:
+        raise RuntimeError("The pending document record could not be finalized.")
+    return {
+        "id": document_id,
+        "title": record.get("title", "Legal document"),
+        "status": "needs_indexing" if record.get("verified") else "needs_review",
+        "verified": record.get("verified") is True,
+        "quality": quality,
+    }
 
 
 def verify_document(document_id: str, verified: bool) -> dict[str, object]:
-    records = load_sources()
-    for relative_path, record in records.items():
-        if record.get("id", relative_path) == document_id:
-            record["verified"] = verified
-            save_sources(records)
-            return {
-                "id": document_id,
-                "verified": verified,
-                "status": "needs_indexing" if verified else "needs_review",
-            }
-    raise KeyError("Document not found.")
+    rows = response_rows(
+        supabase_client()
+        .table("legal_documents")
+        .update({"verified": verified})
+        .eq("id", document_id)
+        .eq("status", "ready")
+        .select("id")
+        .execute()
+    )
+    if not rows:
+        raise KeyError("Document not found.")
+    return {
+        "id": document_id,
+        "verified": verified,
+        "status": "needs_indexing" if verified else "needs_review",
+    }
+
+
+def search_index_chunks(
+    query_terms: str, target_article: str | None, limit: int = 200
+) -> list[dict[str, object]]:
+    response = supabase_client().rpc(
+        "search_legal_chunks",
+        {
+            "p_terms": query_terms,
+            "p_target_article": target_article or "",
+            "p_limit": limit,
+        },
+    ).execute()
+    return response_rows(response)
 
 
 def normalize_page_text(text: str) -> str:
@@ -297,27 +404,22 @@ def analyze_pdf(
 
 
 def build_index() -> dict[str, object]:
-    from langchain_chroma import Chroma
-    from langchain_core.documents import Document
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    records = load_sources()
+    client = supabase_client()
+    records = response_rows(
+        client.table("legal_documents")
+        .select("*")
+        .eq("status", "ready")
+        .eq("verified", True)
+        .execute()
+    )
     documents: list[Document] = []
-    indexed_hashes: dict[str, str] = {}
-    failures: list[str] = []
-    quality_changed = False
+    fingerprints: dict[str, str] = {}
+    indexed_page_count = 0
 
-    indexed_page_counts: dict[str, int] = {}
-    for relative_path, metadata in records.items():
-        path = document_path(relative_path)
-        if path.suffix.lower() != ".pdf" or not path.is_file():
-            failures.append(f"Skipping {relative_path}: PDF file is missing.")
-            continue
-        if metadata.get("verified") is not True:
-            failures.append(f"Skipping {relative_path}: source needs review.")
-            continue
-        source_url = metadata.get("source_url")
-        citation = metadata.get("citation")
+    for record in records:
+        storage_path = str(record["storage_path"])
+        source_url = record.get("source_url")
+        citation = record.get("citation")
         if (
             not isinstance(source_url, str)
             or urlparse(source_url).scheme not in {"http", "https"}
@@ -325,47 +427,60 @@ def build_index() -> dict[str, object]:
             or not isinstance(citation, str)
             or not citation.strip()
         ):
-            failures.append(f"Skipping {relative_path}: citation or source URL is invalid.")
-            continue
-        try:
-            pages, quality = analyze_pdf(path)
-        except (ValueError, OSError) as exc:
-            failures.append(f"Skipping {relative_path}: {exc}")
+            logger.warning("Skipping %s: citation or source URL is invalid.", storage_path)
             continue
 
-        excluded_pages = metadata.get("excluded_pages", [])
-        if not isinstance(excluded_pages, list) or any(
+        content = _download_document(storage_path)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary:
+            temporary.write(content)
+            temporary_path = Path(temporary.name)
+        try:
+            pages, quality = analyze_pdf(temporary_path)
+        except (ValueError, OSError) as exc:
+            logger.warning("Skipping %s: %s", storage_path, exc)
+            continue
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+        excluded_pages = record.get("excluded_pages") or []
+        page_count = int(quality["page_count"])
+        if any(
             not isinstance(page_number, int)
             or isinstance(page_number, bool)
             or page_number < 1
-            or page_number > int(quality["page_count"])
+            or page_number > page_count
             for page_number in excluded_pages
         ):
-            failures.append(f"Skipping {relative_path}: excluded page list is invalid.")
+            logger.warning("Skipping %s: excluded page list is invalid.", storage_path)
             continue
         excluded = set(excluded_pages)
-        pages = [item for item in pages if item[0] not in excluded]
+        pages = [
+            (page_number, text)
+            for page_number, text in pages
+            if page_number not in excluded
+        ]
         if not pages:
-            failures.append(f"Skipping {relative_path}: all pages were excluded.")
+            logger.warning("Skipping %s: all pages were excluded.", storage_path)
             continue
 
-        indexed_hashes[relative_path] = document_fingerprint(path, metadata)
-        indexed_page_counts[relative_path] = len(pages)
-        if metadata.get("quality") != quality:
-            metadata["quality"] = quality
-            quality_changed = True
-        document_id = str(metadata.get("id", relative_path))
+        fingerprint = document_fingerprint(content, record)
+        fingerprints[storage_path] = fingerprint
+        indexed_page_count += len(pages)
+        client.table("legal_documents").update(
+            {"quality": quality, "fingerprint": fingerprint}
+        ).eq("id", record["id"]).execute()
+
         for page_number, page_text in pages:
             documents.append(
                 Document(
                     page_content=page_text,
                     metadata={
-                        "source": relative_path,
-                        "document_id": document_id,
-                        "title": str(metadata.get("title") or path.stem),
+                        "source": storage_path,
+                        "document_id": str(record["id"]),
+                        "title": str(record.get("title") or "Legal document"),
                         "citation": f"{citation.strip()}, PDF p. {page_number}",
                         "jurisdiction": str(
-                            metadata.get("jurisdiction") or "Pakistan"
+                            record.get("jurisdiction") or "Pakistan"
                         ),
                         "source_url": source_url,
                         "page": page_number,
@@ -374,20 +489,10 @@ def build_index() -> dict[str, object]:
                 )
             )
 
-    if failures:
-        print("\n".join(failures), file=sys.stderr)
-
-    if quality_changed:
-        save_sources(records)
     if not documents:
-        raise ValueError(
-            "No reviewed PDFs with extractable text are ready to index."
-        )
+        raise ValueError("No reviewed PDFs with extractable text are ready to index.")
 
-    if documents and not os.getenv("GOOGLE_API_KEY"):
-        raise RuntimeError("Set GOOGLE_API_KEY in backend/.env before indexing.")
-
-    chunks = RecursiveCharacterTextSplitter(
+    splitter = RecursiveCharacterTextSplitter(
         separators=[
             r"\n(?=\d+[A-Z]?\.\s+[A-Z])",
             "\n\n",
@@ -399,58 +504,39 @@ def build_index() -> dict[str, object]:
         chunk_size=1200,
         chunk_overlap=180,
         add_start_index=True,
-    ).split_documents(documents)
-    persist_directory = storage_path()
-    persist_directory.mkdir(parents=True, exist_ok=True)
-    collection_name = (
-        f"pak_law_{datetime.now(timezone.utc):%Y%m%d%H%M%S}_{uuid4().hex[:8]}"
     )
-    configured_embedding_backend = os.getenv("EMBEDDING_BACKEND", "google").lower()
-    embedding_backend = (
-        "placeholder"
-        if configured_embedding_backend == "local"
-        else configured_embedding_backend
-    )
-    embeddings = _build_embeddings(configured_embedding_backend)
-    try:
-        Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            collection_name=collection_name,
-            persist_directory=str(persist_directory),
-        )
-    except Exception as exc:
-        if _quota_error(exc):
-            embeddings = FakeEmbeddings(size=768)
-            try:
-                Chroma.from_documents(
-                    documents=chunks,
-                    embedding=embeddings,
-                    collection_name=collection_name,
-                    persist_directory=str(persist_directory),
-                )
-                embedding_backend = "placeholder"
-            except Exception as fallback_exc:
-                raise EmbeddingQuotaExceeded(
-                    "Gemini embedding quota/rate limit reached (HTTP 429). "
-                    "Wait for the quota to reset or check the Google AI project "
-                    "quota, then retry. The active knowledge index was not changed."
-                ) from fallback_exc
-        else:
-            raise
+    chunks = splitter.split_documents(documents)
+    index_version = str(uuid4())
+    for offset in range(0, len(chunks), 100):
+        batch = [
+            {
+                "index_version": index_version,
+                "content": chunk.page_content,
+                "metadata": chunk.metadata,
+            }
+            for chunk in chunks[offset : offset + 100]
+        ]
+        client.table("legal_chunks").insert(batch).execute()
 
+    indexed_at = datetime.now(timezone.utc).isoformat()
+    client.rpc(
+        "activate_legal_index",
+        {
+            "p_active_version": index_version,
+            "p_fingerprints": fingerprints,
+            "p_document_count": len(fingerprints),
+            "p_indexed_page_count": indexed_page_count,
+            "p_chunk_count": len(chunks),
+            "p_indexed_at": indexed_at,
+        },
+    ).execute()
     manifest = {
-        "collection_name": collection_name,
-        "embedding_backend": embedding_backend,
+        "index_version": index_version,
         "retrieval_backend": "bm25",
         "chunk_count": len(chunks),
-        "document_count": len(indexed_hashes),
-        "indexed_page_count": sum(indexed_page_counts.values()),
-        "documents": indexed_hashes,
-        "indexed_at": datetime.now(timezone.utc).isoformat(),
+        "document_count": len(fingerprints),
+        "indexed_page_count": indexed_page_count,
+        "documents": fingerprints,
+        "indexed_at": indexed_at,
     }
-    manifest_path = persist_directory / "active-index.json"
-    temporary_manifest = manifest_path.with_suffix(".tmp")
-    temporary_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    temporary_manifest.replace(manifest_path)
     return manifest

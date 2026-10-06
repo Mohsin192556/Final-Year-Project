@@ -3,43 +3,39 @@ import os
 import re
 import secrets
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
-from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import (
     Depends,
     FastAPI,
-    File,
-    Form,
     Header,
     HTTPException,
-    UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.library import (
-    DOCUMENTS_DIR,
-    EmbeddingQuotaExceeded,
-    analyze_pdf,
+    active_index_manifest,
     build_index,
+    complete_document_upload,
+    create_document_upload,
     list_documents,
-    load_sources,
     preview_document,
-    save_sources,
-    storage_path,
     verify_document,
 )
-from app.schemas import ChatRequest, ChatResponse, VerificationRequest
+from app.schemas import (
+    ChatRequest,
+    ChatResponse,
+    DocumentUploadIntent,
+    VerificationRequest,
+)
+from app.supabase_store import SupabaseConfigurationError
 
 load_dotenv()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 library_lock = threading.Lock()
-MAX_PDF_BYTES = 30 * 1024 * 1024
 MAX_PAGE_NUMBER = 1000
 
 app = FastAPI(
@@ -132,6 +128,8 @@ def chat(request: ChatRequest) -> ChatResponse:
             question=request.question.strip(),
             history=[item.model_dump() for item in request.history[-8:]],
         )
+    except SupabaseConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=503,
@@ -154,8 +152,16 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 @app.get("/api/health/knowledge-base")
 def knowledge_base_health() -> dict[str, str]:
-    manifest = storage_path() / "active-index.json"
-    if not manifest.is_file():
+    try:
+        manifest = active_index_manifest()
+    except SupabaseConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not check legal knowledge-base status.")
+        raise HTTPException(
+            status_code=503, detail="Could not check the legal knowledge base."
+        ) from exc
+    if manifest is None:
         return {"status": "not_indexed"}
     return {"status": "indexed"}
 
@@ -166,100 +172,64 @@ def get_documents() -> dict[str, object]:
         return {"documents": list_documents()}
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/api/documents/upload", dependencies=[Depends(require_admin)])
-async def upload_document(
-    file: UploadFile = File(...),
-    title: str = Form(min_length=2, max_length=200),
-    citation: str = Form(min_length=2, max_length=300),
-    jurisdiction: str = Form(min_length=2, max_length=120),
-    source_url: str = Form(min_length=8, max_length=2000),
-    verified: bool = Form(default=False),
-    excluded_pages: str = Form(default="", max_length=500),
-) -> dict[str, object]:
-    clean_title = title.strip()
-    clean_citation = citation.strip()
-    clean_jurisdiction = jurisdiction.strip()
-    clean_url = source_url.strip()
-    pages_to_exclude = parse_excluded_pages(excluded_pages)
-    parsed_url = urlparse(clean_url)
-    if not clean_title or not clean_citation or not clean_jurisdiction:
-        raise HTTPException(
-            status_code=422, detail="Title, citation, and jurisdiction are required."
-        )
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        raise HTTPException(
-            status_code=422, detail="Source URL must be an HTTP or HTTPS link."
-        )
-    if not file.filename or Path(file.filename).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=415, detail="Upload a PDF file.")
-
-    content = await file.read(MAX_PDF_BYTES + 1)
-    if len(content) > MAX_PDF_BYTES:
-        raise HTTPException(
-            status_code=413, detail="PDF exceeds the 30 MB upload limit."
-        )
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(status_code=415, detail="The selected file is not a PDF.")
-
-    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    document_id = str(uuid4())
-    relative_path = f"uploads/{document_id}.pdf"
-    destination = DOCUMENTS_DIR / relative_path
-    temporary_path = destination.with_suffix(".upload")
-    try:
-        from pypdf.errors import PdfReadError
-
-        temporary_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path.write_bytes(content)
-        _, quality = analyze_pdf(temporary_path, max_pages=1000)
-
-        with library_lock:
-            records = load_sources()
-            temporary_path.replace(destination)
-            records[relative_path] = {
-                "id": document_id,
-                "title": clean_title,
-                "citation": clean_citation,
-                "jurisdiction": clean_jurisdiction,
-                "source_url": clean_url,
-                "original_filename": Path(file.filename).name[:255],
-                "verified": verified,
-                "excluded_pages": pages_to_exclude,
-                "quality": quality,
-                "uploaded_at": datetime.now(timezone.utc).isoformat(),
-            }
-            try:
-                save_sources(records)
-            except Exception:
-                destination.unlink(missing_ok=True)
-                raise
-    except HTTPException:
-        temporary_path.unlink(missing_ok=True)
-        raise
-    except ValueError as exc:
-        temporary_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=f"Could not read PDF: {exc}") from exc
-    except PdfReadError as exc:
-        temporary_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=422, detail="The uploaded PDF is damaged or invalid."
-        ) from exc
     except Exception as exc:
-        temporary_path.unlink(missing_ok=True)
-        logger.exception("PDF upload failed.")
+        logger.exception("Could not load the document library.")
         raise HTTPException(
-            status_code=500, detail="Could not save the PDF to the document library."
+            status_code=502, detail="The document library is unavailable."
         ) from exc
 
-    return {
-        "id": document_id,
-        "title": clean_title,
-        "status": "needs_indexing" if verified else "needs_review",
-        "verified": verified,
-        "quality": quality,
-    }
+
+@app.post(
+    "/api/documents/upload-intent",
+    dependencies=[Depends(require_admin)],
+)
+def document_upload_intent(request: DocumentUploadIntent) -> dict[str, object]:
+    if Path(request.filename).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=415, detail="Upload a PDF file.")
+    title = request.title.strip()
+    citation = request.citation.strip()
+    jurisdiction = request.jurisdiction.strip()
+    if not title or not citation or not jurisdiction:
+        raise HTTPException(
+            status_code=422,
+            detail="Title, citation, and jurisdiction are required.",
+        )
+    pages_to_exclude = parse_excluded_pages(request.excluded_pages)
+    try:
+        return create_document_upload(
+            title=title,
+            citation=citation,
+            jurisdiction=jurisdiction,
+            source_url=str(request.source_url),
+            original_filename=request.filename,
+            verified=request.verified,
+            excluded_pages=pages_to_exclude,
+        )
+    except Exception as exc:
+        logger.exception("Could not prepare a signed PDF upload.")
+        raise HTTPException(
+            status_code=502, detail="Could not prepare a secure PDF upload."
+        ) from exc
+
+
+@app.post(
+    "/api/documents/{document_id}/complete-upload",
+    dependencies=[Depends(require_admin)],
+)
+def finish_document_upload(document_id: str) -> dict[str, object]:
+    try:
+        with library_lock:
+            return complete_document_upload(document_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PDF upload validation failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not validate the uploaded PDF. Check backend logs.",
+        ) from exc
 
 
 @app.post(
@@ -277,6 +247,11 @@ def update_document_verification(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not change document verification.")
+        raise HTTPException(
+            status_code=502, detail="Could not update document verification."
+        ) from exc
 
 
 @app.get(
@@ -298,6 +273,11 @@ def get_document_preview(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not preview the legal document.")
+        raise HTTPException(
+            status_code=502, detail="Could not load the document preview."
+        ) from exc
 
 
 @app.post("/api/documents/index", dependencies=[Depends(require_admin)])
@@ -312,13 +292,11 @@ def index_documents() -> dict[str, object]:
             "indexed_page_count": manifest["indexed_page_count"],
             "indexed_at": manifest["indexed_at"],
         }
-    except EmbeddingQuotaExceeded as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
-    except (RuntimeError, ValueError) as exc:
+    except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Document indexing failed.")
         raise HTTPException(
             status_code=502,
-            detail="Indexing failed. Check the backend logs and Gemini configuration.",
+            detail="Indexing failed. Check the backend logs and Supabase configuration.",
         ) from exc

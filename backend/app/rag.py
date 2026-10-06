@@ -1,16 +1,14 @@
-import json
 import math
 import os
 import re
 from collections import Counter
 from typing import Any
 
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from app.library import storage_path
+from app.library import active_index_manifest, search_index_chunks
 from app.schemas import Source
 
 SYSTEM_PROMPT = """You are a careful legal information assistant focused on Pakistan.
@@ -66,19 +64,18 @@ STOP_WORDS = {
 }
 
 
-def _load_index() -> tuple[Chroma, dict[str, Any]]:
-    persist_directory = storage_path()
-    manifest_path = persist_directory / "active-index.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError("No active legal knowledge base index.")
+class SupabaseSearchIndex:
+    def search(
+        self, query_terms: str, target_article: str | None, limit: int
+    ) -> list[dict[str, object]]:
+        return search_index_chunks(query_terms, target_article, limit)
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    vector_store = Chroma(
-        collection_name=manifest["collection_name"],
-        embedding_function=None,
-        persist_directory=str(persist_directory),
-    )
-    return vector_store, manifest
+
+def _load_index() -> tuple[SupabaseSearchIndex, dict[str, Any]]:
+    manifest = active_index_manifest()
+    if manifest is None:
+        raise FileNotFoundError("No active legal knowledge base index.")
+    return SupabaseSearchIndex(), manifest
 
 
 def _tokens(text: str) -> list[str]:
@@ -90,20 +87,29 @@ def _tokens(text: str) -> list[str]:
 
 
 def _retrieve_relevant_documents(
-    vector_store: Chroma, question: str, limit: int = 5
+    vector_store: Any, question: str, limit: int = 5
 ) -> list[Document]:
-    records = vector_store.get(include=["documents", "metadatas"])
-    texts = records.get("documents") or []
-    metadatas = records.get("metadatas") or []
-    if not texts or len(texts) != len(metadatas):
-        return []
-
     article_match = re.search(r"\barticle\s+(\d+[a-z]?)\b", question, re.IGNORECASE)
     target_article = article_match.group(1).casefold() if article_match else None
     query_tokens = _tokens(question)
     if target_article:
         query_tokens = [token for token in query_tokens if token != target_article]
     if not query_tokens and not target_article:
+        return []
+
+    if hasattr(vector_store, "search"):
+        records = vector_store.search(
+            " | ".join(query_tokens),
+            target_article,
+            max(200, limit),
+        )
+        texts = [record.get("content", "") for record in records]
+        metadatas = [record.get("metadata", {}) for record in records]
+    else:
+        records = vector_store.get(include=["documents", "metadatas"])
+        texts = records.get("documents") or []
+        metadatas = records.get("metadatas") or []
+    if not texts or len(texts) != len(metadatas):
         return []
 
     tokenized_documents = [_tokens(text or "") for text in texts]
@@ -148,9 +154,11 @@ def _retrieve_relevant_documents(
                 re.IGNORECASE,
             )
             heading_terms = set(_tokens(heading.group(1))) if heading else set()
-            if heading and heading_terms.intersection(query_counts):
+            if heading and (
+                not query_counts or heading_terms.intersection(query_counts)
+            ):
                 score += 8.0
-            elif query_tokens and re.search(
+            elif re.search(
                 rf"\b(?:article|art\.)\s+{re.escape(target_article)}\b",
                 text or "",
                 re.IGNORECASE,

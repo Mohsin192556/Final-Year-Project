@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { FormEvent, useCallback, useRef, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 import { apiUrl } from "../../lib/api";
 
 type LegalDocument = {
@@ -98,27 +99,59 @@ export default function LibraryPage() {
     setBusy(true);
     setError("");
     setNotice("");
-    const body = new FormData();
-    body.set("file", selectedFile);
-    body.set("title", title);
-    body.set("citation", citation);
-    body.set("jurisdiction", jurisdiction);
-    body.set("source_url", sourceUrl);
-    body.set("verified", String(verified));
-    body.set("excluded_pages", excludedPages);
     try {
-      const response = await request("/api/documents/upload", {
+      const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+      const supabaseAnonKey =
+        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
+      if (!supabaseUrl || !supabaseAnonKey) {
+        throw new Error(
+          "Supabase upload settings are missing. Configure the public Supabase URL and anon key in Vercel, then redeploy.",
+        );
+      }
+
+      const response = await request("/api/documents/upload-intent", {
         method: "POST",
-        body,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: selectedFile.name,
+          title,
+          citation,
+          jurisdiction,
+          source_url: sourceUrl,
+          verified,
+          excluded_pages: excludedPages,
+        }),
       });
-      const payload = await response.json();
+      const intent = await response.json();
       if (!response.ok) {
-        throw new Error(payload.detail ?? "The PDF could not be uploaded.");
+        throw new Error(intent.detail ?? "Could not prepare the PDF upload.");
+      }
+
+      const supabase = createClient(supabaseUrl, supabaseAnonKey);
+      const { error: storageError } = await supabase.storage
+        .from(intent.bucket)
+        .uploadToSignedUrl(
+          intent.storage_path,
+          intent.upload_token,
+          selectedFile,
+          { contentType: "application/pdf" },
+        );
+      if (storageError) {
+        throw new Error(`Supabase upload failed: ${storageError.message}`);
+      }
+
+      const completedResponse = await request(
+        `/api/documents/${encodeURIComponent(intent.id)}/complete-upload`,
+        { method: "POST" },
+      );
+      const payload = await completedResponse.json();
+      if (!completedResponse.ok) {
+        throw new Error(payload.detail ?? "The uploaded PDF could not be validated.");
       }
       setNotice(
-        verified
-          ? "PDF uploaded. It is ready to be added to the search index."
-          : "PDF uploaded to the review queue. Verify the source before indexing it.",
+        payload.verified
+          ? "PDF uploaded to Supabase. It is ready to be added to the search index."
+          : "PDF uploaded to Supabase and added to the review queue. Verify the source before indexing it.",
       );
       setTitle("");
       setCitation("");

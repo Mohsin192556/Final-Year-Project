@@ -1,10 +1,8 @@
 # Legal source documents
 
-The `/library` page uploads text-based PDFs and records each document's citation,
-jurisdiction, and official source URL in `sources.json`. The indexer includes
-only entries explicitly marked `"verified": true`. Verify authenticity,
-currency, jurisdiction, and lawful reuse before marking a document reviewed.
+Uploaded PDFs, source metadata, and searchable passages are stored in Supabase.
+Run `backend/supabase/schema.sql` in the Supabase SQL Editor before using the
+document library. Only sources explicitly marked reviewed are indexed.
 
-Scanned/image-only PDFs must be OCR'd first. Run `python ingest_documents.py`
-from the `backend` directory to rebuild the search index from the reviewed
-library without using the web interface.
+Scanned/image-only PDFs must be OCR'd before upload. The backend validates
+uploaded files and rejects PDFs without selectable text.

@@ -62,6 +62,30 @@ def test_retrieval_ranks_the_requested_constitution_article_first() -> None:
     assert all(result.metadata["page"] != 216 for result in results)
 
 
+def test_retrieval_uses_supabase_full_text_search_before_bm25() -> None:
+    class SupabaseIndex:
+        def __init__(self) -> None:
+            self.search_args = None
+
+        def search(self, query_terms: str, target_article: str, limit: int):
+            self.search_args = (query_terms, target_article, limit)
+            return [
+                {
+                    "content": "19. Freedom of speech, etc.\n\n"
+                    "19. Every citizen has freedom of speech.",
+                    "metadata": {"page": 23},
+                }
+            ]
+
+    index = SupabaseIndex()
+    results = _retrieve_relevant_documents(
+        index, "What does Article 19 say about freedom of speech?"
+    )
+
+    assert index.search_args == ("freedom | speech", "19", 200)
+    assert results[0].metadata["page"] == 23
+
+
 def test_gemini_content_blocks_are_converted_to_plain_text() -> None:
     content = [
         {"type": "text", "text": "Article 19 protects freedom of speech."},

@@ -46,3 +46,13 @@ class ChatResponse(BaseModel):
 
 class VerificationRequest(BaseModel):
     verified: bool
+
+
+class DocumentUploadIntent(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=2, max_length=200)
+    citation: str = Field(min_length=2, max_length=300)
+    jurisdiction: str = Field(min_length=2, max_length=120)
+    source_url: AnyHttpUrl
+    verified: bool = False
+    excluded_pages: str = Field(default="", max_length=500)
